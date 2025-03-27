@@ -140,7 +140,7 @@ else
 fi
 
 echo -e "${BLUE}╔════════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${BLUE}║            ${YELLOW}เริ่มต้นกระบวนการสร้าง $KEYSTORE_FORMAT Keystore${BLUE}               ║${NC}"
+echo -e "${BLUE}║            ${YELLOW}เริ่มต้นกระบวนการสร้าง $KEYSTORE_FORMAT Keystore${BLUE}                     ║${NC}"
 echo -e "${BLUE}╚════════════════════════════════════════════════════════════════╝${NC}"
 echo ""
 
@@ -201,7 +201,7 @@ echo ""
 echo -e "${GREEN}✅ การสร้าง $KEYSTORE_FORMAT Keystore สำเร็จ:${NC} ${YELLOW}$OUTPUT_KEYSTORE${NC}"
 echo ""
 # แสดงรายละเอียด keystore ในรูปแบบที่สวยงาม
-echo -e "${PURPLE}┌─────────────────── รายละเอียด Keystore ───────────────────┐${NC}"
+echo -e "${PURPLE}┌────────────────────── รายละเอียด Keystore ───────────────────────┐${NC}"
 
 # ดึงข้อมูล keystore แบบครบถ้วนโดยไม่ใช้ pipe และซ่อน warning
 KEYSTORE_INFO=$(keytool -list -v -keystore "$OUTPUT_KEYSTORE" -storepass "$KEYSTORE_PASS" -storetype "$KEYSTORE_FORMAT" 2>&1 | grep -v "Warning:" | grep -v "proprietary format" | grep -v "migrate to PKCS12")
@@ -324,7 +324,7 @@ else
     echo -e "${PURPLE}│${NC} ${YELLOW}ไม่พบข้อมูล certificate${NC}"
 fi
 
-echo -e "${PURPLE}└────────────────────────────────────────────────────────────┘${NC}"
+echo -e "${PURPLE}└────────────────────────────────────────────────────────────────┘${NC}"
 
 echo ""
 echo -e "${YELLOW}╔════════════════════════════════════════════════════════════════╗${NC}"
@@ -334,7 +334,7 @@ echo ""
 echo -e "${CYAN}1.${NC} คัดลอกไฟล์ ${GREEN}$OUTPUT_KEYSTORE${NC} ไปยังโฟลเดอร์ที่ต้องการ (เช่น /etc/tomcat/ssl/)"
 echo -e "${CYAN}2.${NC} แก้ไขไฟล์ ${GREEN}server.xml${NC} ของ Tomcat โดยเพิ่ม connector ดังนี้:"
 echo ""
-echo -e "${BLUE}┌─────────────── Tomcat Configuration Example ──────────────┐${NC}"
+echo -e "${BLUE}┌───────────────── Tomcat Configuration Example ─────────────────┐${NC}"
 echo -e "${BLUE}│${NC}"
 echo -e "${BLUE}│${NC} ${GREEN}<Connector${NC} ${YELLOW}port${NC}=${CYAN}\"8443\"${NC} ${YELLOW}protocol${NC}=${CYAN}\"org.apache.coyote.http11.Http11NioProtocol\"${NC}"
 echo -e "${BLUE}│${NC}            ${YELLOW}maxThreads${NC}=${CYAN}\"150\"${NC} ${YELLOW}SSLEnabled${NC}=${CYAN}\"true\"${NC}${GREEN}>${NC}"
@@ -348,7 +348,7 @@ echo -e "${BLUE}│${NC}                      ${YELLOW}type${NC}=${CYAN}\"RSA\"$
 echo -e "${BLUE}│${NC}     ${GREEN}</SSLHostConfig>${NC}"
 echo -e "${BLUE}│${NC} ${GREEN}</Connector>${NC}"
 echo -e "${BLUE}│${NC}"
-echo -e "${BLUE}└─────────────────────────────────────────────────────────────┘${NC}"
+echo -e "${BLUE}└────────────────────────────────────────────────────────────────┘${NC}"
 echo ""
 
 # แสดงข้อมูลเพิ่มเติมสำหรับ Tomcat รุ่นต่างๆ
@@ -362,4 +362,4 @@ fi
 
 echo -e "${CYAN}3.${NC} รีสตาร์ท Tomcat เพื่อให้การเปลี่ยนแปลงมีผล"
 echo ""
-echo -e "${YELLOW}การดำเนินการเสร็จสิ้น ${GREEN}✨${NC}"
+echo -e "${YELLOW}การดำเนินการเสร็จสิ้น ${GREEN}✨${NC}\n"
