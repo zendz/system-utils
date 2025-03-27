@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# สคริปต์สำหรับสร้าง JKS Keystore จาก certificate และ private key
+# สคริปต์สำหรับสร้าง Keystore จาก certificate และ private key
 # เหมาะสำหรับใช้กับ Tomcat
 
 # กำหนดสีสำหรับแสดงผล
@@ -26,10 +26,10 @@ fi
 # ฟังก์ชั่นแสดงวิธีใช้งาน
 usage() {
     echo -e "${BLUE}╔════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║            ${YELLOW}เครื่องมือสร้าง JKS Keystore สำหรับ Tomcat${BLUE}            ║${NC}"
+    echo -e "${BLUE}║            ${YELLOW}เครื่องมือสร้าง Keystore สำหรับ Tomcat${BLUE}               ║${NC}"
     echo -e "${BLUE}╚════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
-    echo -e "${CYAN}วิธีใช้งาน:${NC} $0 -c <certificate> -i <intermediate_chain> -k <private_key> [-p <keystore_password>] [-a <alias>] [-o <output_jks>]"
+    echo -e "${CYAN}วิธีใช้งาน:${NC} $0 -c <certificate> -i <intermediate_chain> -k <private_key> [-p <keystore_password>] [-a <alias>] [-o <output_keystore>] [-f <format>]"
     echo ""
     echo -e "${YELLOW}พารามิเตอร์ที่จำเป็น:${NC}"
     echo -e "  ${GREEN}-c${NC}   ไฟล์ certificate (เช่น website.crt)"
@@ -38,12 +38,14 @@ usage() {
     echo ""
     echo -e "${YELLOW}พารามิเตอร์ทางเลือก:${NC}"
     echo -e "  ${GREEN}-p${NC}   รหัสผ่านสำหรับ keystore (ค่าเริ่มต้น: xxxxxxxx)"
-    echo -e "  ${GREEN}-a${NC}   alias ที่ใช้ในการเก็บ certificate ใน keystore (ค่าเริ่มต้น: magicinfo)"
-    echo -e "  ${GREEN}-o${NC}   ชื่อไฟล์ output keystore (ค่าเริ่มต้น: keystore.jks)"
+    echo -e "  ${GREEN}-a${NC}   alias ที่ใช้ในการเก็บ certificate ใน keystore (ค่าเริ่มต้น: demo)"
+    echo -e "  ${GREEN}-o${NC}   ชื่อไฟล์ output keystore (ค่าเริ่มต้น: demo.jks หรือ demo.p12)"
+    echo -e "  ${GREEN}-f${NC}   รูปแบบของ keystore: JKS หรือ PKCS12 (ค่าเริ่มต้น: JKS)"
     echo ""
     echo -e "${YELLOW}ตัวอย่าง:${NC}"
     echo -e "  $0 -c website.crt -i chain.crt -k website.key"
     echo -e "  $0 -c website.crt -i chain.crt -k website.key -p mypassword -a mywebsite -o mywebsite.jks"
+    echo -e "  $0 -c website.crt -i chain.crt -k website.key -f PKCS12 -o mywebsite.p12"
     exit 1
 }
 
@@ -53,50 +55,38 @@ CHAIN_FILE=""
 KEY_FILE=""
 KEYSTORE_PASS="xxxxxxxx"
 ALIAS="demo"
-OUTPUT_JKS="demo.jks"
-MASKED_PASS=""  # เริ่มต้นค่าว่างเปล่า
+KEYSTORE_FORMAT="JKS"  # ค่าเริ่มต้นเป็น JKS
+OUTPUT_KEYSTORE=""     # จะกำหนดในภายหลังตาม format
+MASKED_PASS=""         # เริ่มต้นค่าว่างเปล่า
 
 # รับค่าพารามิเตอร์
-while getopts "c:i:k:p:a:o:" opt; do
+while getopts "c:i:k:p:a:o:f:" opt; do
     case $opt in
         c) CERT_FILE="$OPTARG" ;;
         i) CHAIN_FILE="$OPTARG" ;;
         k) KEY_FILE="$OPTARG" ;;
-        p) KEYSTORE_PASS="$OPTARG" ;;  # แก้ไข OPTARG (จากเดิม OPTARG)
-        a) ALIAS="$OPTARG" ;;          # แก้ไข OPTARG (จากเดิม OPTARG)
-        o) OUTPUT_JKS="$OPTARG" ;;     # แก้ไข OPTARG (จากเดิม OPTARG)
+        p) KEYSTORE_PASS="$OPTARG" ;;
+        a) ALIAS="$OPTARG" ;;
+        o) OUTPUT_KEYSTORE="$OPTARG" ;;
+        f) KEYSTORE_FORMAT=$(echo "$OPTARG" | tr '[:lower:]' '[:upper:]') ;;
         *) usage ;;
     esac
 done
 
-# สร้าง masked passphrase สำหรับแสดงผล
-if [[ ${#KEYSTORE_PASS} -gt 0 ]]; then
-    # แสดงอักขระแรกและสุดท้าย และแทนที่ตัวอื่นๆ ด้วย *
-    if [[ ${#KEYSTORE_PASS} -gt 2 ]]; then
-        FIRST_CHAR="${KEYSTORE_PASS:0:1}"
-        LAST_CHAR="${KEYSTORE_PASS: -1}"
-        MIDDLE_STARS=$(printf '%*s' $((${#KEYSTORE_PASS}-2)) '' | tr ' ' '*')
-        MASKED_PASS="${FIRST_CHAR}${MIDDLE_STARS}${LAST_CHAR}"
-    else
-        # หากรหัสผ่านสั้นเกินไปให้แสดงดาวทั้งหมด
-        MASKED_PASS=$(printf '%*s' ${#KEYSTORE_PASS} '' | tr ' ' '*')
-    fi
-else
-    MASKED_PASS=""
+# ตรวจสอบว่า format ถูกต้อง
+if [[ "$KEYSTORE_FORMAT" != "JKS" && "$KEYSTORE_FORMAT" != "PKCS12" ]]; then
+    echo -e "${RED}❌ Error: รูปแบบ keystore ไม่ถูกต้อง ต้องเป็น JKS หรือ PKCS12 เท่านั้น${NC}"
+    exit 1
 fi
 
-# รับค่าพารามิเตอร์
-while getopts "c:i:k:p:a:o:" opt; do
-    case $opt in
-        c) CERT_FILE="$OPTARG" ;;
-        i) CHAIN_FILE="$OPTARG" ;;
-        k) KEY_FILE="$OPTARG" ;;
-        p) KEYSTORE_PASS="$OPTARG" ;;  # แก้ไข OPTARG (จากเดิม OPTARG)
-        a) ALIAS="$OPTARG" ;;          # แก้ไข OPTARG (จากเดิม OPTARG)
-        o) OUTPUT_JKS="$OPTARG" ;;     # แก้ไข OPTARG (จากเดิม OPTARG)
-        *) usage ;;
-    esac
-done
+# กำหนดค่า output filename ถ้ายังไม่ได้ระบุ
+if [[ -z "$OUTPUT_KEYSTORE" ]]; then
+    if [[ "$KEYSTORE_FORMAT" == "JKS" ]]; then
+        OUTPUT_KEYSTORE="demo.jks"
+    else
+        OUTPUT_KEYSTORE="demo.p12"
+    fi
+fi
 
 # ตรวจสอบค่าพารามิเตอร์จำเป็นถูกระบุครบหรือไม่
 if [[ -z "$CERT_FILE" || -z "$CHAIN_FILE" || -z "$KEY_FILE" ]]; then
@@ -150,7 +140,7 @@ else
 fi
 
 echo -e "${BLUE}╔════════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${BLUE}║            ${YELLOW}เริ่มต้นกระบวนการสร้าง JKS Keystore${BLUE}                  ║${NC}"
+echo -e "${BLUE}║            ${YELLOW}เริ่มต้นกระบวนการสร้าง $KEYSTORE_FORMAT Keystore${BLUE}               ║${NC}"
 echo -e "${BLUE}╚════════════════════════════════════════════════════════════════╝${NC}"
 echo ""
 
@@ -176,18 +166,31 @@ if [[ $? -ne 0 ]]; then
 fi
 echo -e "      ${GREEN}✅ แปลงเป็น PKCS12 เรียบร้อย${NC}"
 
-# แปลง PKCS12 เป็น JKS format
-echo -e "${CYAN}[3/4]${NC} กำลังแปลง PKCS12 เป็น JKS format..."
-keytool -importkeystore -srckeystore "$PKCS12_FILE" -srcstoretype PKCS12 \
-    -srcstorepass "$KEYSTORE_PASS" -destkeystore "$OUTPUT_JKS" \
-    -deststoretype JKS -deststorepass "$KEYSTORE_PASS"
+# ถ้าเลือก format เป็น PKCS12 ก็ใช้ไฟล์ PKCS12 โดยตรง
+if [[ "$KEYSTORE_FORMAT" == "PKCS12" ]]; then
+    echo -e "${CYAN}[3/4]${NC} กำลังใช้ PKCS12 format ตามที่ระบุ..."
+    cp "$PKCS12_FILE" "$OUTPUT_KEYSTORE"
+    
+    if [[ $? -ne 0 ]]; then
+        echo -e "${RED}❌ Error: ไม่สามารถคัดลอกไฟล์ PKCS12 ได้${NC}"
+        rm -rf "$TEMP_DIR"
+        exit 1
+    fi
+    echo -e "      ${GREEN}✅ สร้างไฟล์ PKCS12 เรียบร้อย${NC}"
+else
+    # แปลง PKCS12 เป็น JKS format (กรณีเลือก JKS)
+    echo -e "${CYAN}[3/4]${NC} กำลังแปลง PKCS12 เป็น JKS format..."
+    keytool -importkeystore -srckeystore "$PKCS12_FILE" -srcstoretype PKCS12 \
+        -srcstorepass "$KEYSTORE_PASS" -destkeystore "$OUTPUT_KEYSTORE" \
+        -deststoretype JKS -deststorepass "$KEYSTORE_PASS"
 
-if [[ $? -ne 0 ]]; then
-    echo -e "${RED}❌ Error: ไม่สามารถแปลงเป็น JKS format ได้${NC}"
-    rm -rf "$TEMP_DIR"
-    exit 1
+    if [[ $? -ne 0 ]]; then
+        echo -e "${RED}❌ Error: ไม่สามารถแปลงเป็น JKS format ได้${NC}"
+        rm -rf "$TEMP_DIR"
+        exit 1
+    fi
+    echo -e "      ${GREEN}✅ แปลงเป็น JKS เรียบร้อย${NC}"
 fi
-echo -e "      ${GREEN}✅ แปลงเป็น JKS เรียบร้อย${NC}"
 
 # ลบไฟล์ชั่วคราว
 echo -e "${CYAN}[4/4]${NC} กำลังทำความสะอาดไฟล์ชั่วคราว..."
@@ -195,13 +198,13 @@ rm -rf "$TEMP_DIR"
 echo -e "      ${GREEN}✅ ทำความสะอาดเรียบร้อย${NC}"
 
 echo ""
-echo -e "${GREEN}✅ การสร้าง JKS Keystore สำเร็จ:${NC} ${YELLOW}$OUTPUT_JKS${NC}"
+echo -e "${GREEN}✅ การสร้าง $KEYSTORE_FORMAT Keystore สำเร็จ:${NC} ${YELLOW}$OUTPUT_KEYSTORE${NC}"
 echo ""
 # แสดงรายละเอียด keystore ในรูปแบบที่สวยงาม
 echo -e "${PURPLE}┌─────────────────── รายละเอียด Keystore ───────────────────┐${NC}"
 
 # ดึงข้อมูล keystore แบบครบถ้วนโดยไม่ใช้ pipe และซ่อน warning
-KEYSTORE_INFO=$(keytool -list -v -keystore "$OUTPUT_JKS" -storepass "$KEYSTORE_PASS" 2>&1 | grep -v "Warning:" | grep -v "proprietary format" | grep -v "migrate to PKCS12")
+KEYSTORE_INFO=$(keytool -list -v -keystore "$OUTPUT_KEYSTORE" -storepass "$KEYSTORE_PASS" -storetype "$KEYSTORE_FORMAT" 2>&1 | grep -v "Warning:" | grep -v "proprietary format" | grep -v "migrate to PKCS12")
 
 # แสดงประเภท keystore
 STORE_TYPE=$(echo "$KEYSTORE_INFO" | grep "Keystore type:" | head -1)
@@ -325,10 +328,10 @@ echo -e "${PURPLE}└───────────────────�
 
 echo ""
 echo -e "${YELLOW}╔════════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${YELLOW}║                  วิธีใช้งานกับ Tomcat                           ║${NC}"
+echo -e "${YELLOW}║                  วิธีใช้งานกับ Tomcat                              ║${NC}"
 echo -e "${YELLOW}╚════════════════════════════════════════════════════════════════╝${NC}"
 echo ""
-echo -e "${CYAN}1.${NC} คัดลอกไฟล์ ${GREEN}$OUTPUT_JKS${NC} ไปยังโฟลเดอร์ที่ต้องการ (เช่น /etc/tomcat/ssl/)"
+echo -e "${CYAN}1.${NC} คัดลอกไฟล์ ${GREEN}$OUTPUT_KEYSTORE${NC} ไปยังโฟลเดอร์ที่ต้องการ (เช่น /etc/tomcat/ssl/)"
 echo -e "${CYAN}2.${NC} แก้ไขไฟล์ ${GREEN}server.xml${NC} ของ Tomcat โดยเพิ่ม connector ดังนี้:"
 echo ""
 echo -e "${BLUE}┌─────────────── Tomcat Configuration Example ──────────────┐${NC}"
@@ -336,14 +339,27 @@ echo -e "${BLUE}│${NC}"
 echo -e "${BLUE}│${NC} ${GREEN}<Connector${NC} ${YELLOW}port${NC}=${CYAN}\"8443\"${NC} ${YELLOW}protocol${NC}=${CYAN}\"org.apache.coyote.http11.Http11NioProtocol\"${NC}"
 echo -e "${BLUE}│${NC}            ${YELLOW}maxThreads${NC}=${CYAN}\"150\"${NC} ${YELLOW}SSLEnabled${NC}=${CYAN}\"true\"${NC}${GREEN}>${NC}"
 echo -e "${BLUE}│${NC}     ${GREEN}<SSLHostConfig>${NC}"
-echo -e "${BLUE}│${NC}         ${GREEN}<Certificate${NC} ${YELLOW}certificateKeystoreFile${NC}=${CYAN}\"/path/to/$OUTPUT_JKS\"${NC}"
+echo -e "${BLUE}│${NC}         ${GREEN}<Certificate${NC} ${YELLOW}certificateKeystoreFile${NC}=${CYAN}\"/path/to/$OUTPUT_KEYSTORE\"${NC}"
 echo -e "${BLUE}│${NC}                      ${YELLOW}certificateKeystorePassword${NC}=${CYAN}\"$MASKED_PASS\"${NC}"
+if [[ "$KEYSTORE_FORMAT" == "PKCS12" ]]; then
+echo -e "${BLUE}│${NC}                      ${YELLOW}certificateKeystoreType${NC}=${CYAN}\"PKCS12\"${NC}"
+fi
 echo -e "${BLUE}│${NC}                      ${YELLOW}type${NC}=${CYAN}\"RSA\"${NC} ${GREEN}/>${NC}"
 echo -e "${BLUE}│${NC}     ${GREEN}</SSLHostConfig>${NC}"
 echo -e "${BLUE}│${NC} ${GREEN}</Connector>${NC}"
 echo -e "${BLUE}│${NC}"
 echo -e "${BLUE}└─────────────────────────────────────────────────────────────┘${NC}"
 echo ""
+
+# แสดงข้อมูลเพิ่มเติมสำหรับ Tomcat รุ่นต่างๆ
+if [[ "$KEYSTORE_FORMAT" == "PKCS12" ]]; then
+    echo -e "${YELLOW}ข้อมูลเพิ่มเติม:${NC}"
+    echo -e "${CYAN}•${NC} รูปแบบ ${GREEN}PKCS12${NC} เป็นมาตรฐานอุตสาหกรรมที่แนะนำให้ใช้แทน JKS"
+    echo -e "${CYAN}•${NC} Tomcat รองรับ PKCS12 ตั้งแต่เวอร์ชัน 8.5 เป็นต้นไป"
+    echo -e "${CYAN}•${NC} ตั้งแต่ Java 9 เป็นต้นไป PKCS12 ได้กลายเป็นรูปแบบมาตรฐานสำหรับ keystore"
+    echo ""
+fi
+
 echo -e "${CYAN}3.${NC} รีสตาร์ท Tomcat เพื่อให้การเปลี่ยนแปลงมีผล"
 echo ""
 echo -e "${YELLOW}การดำเนินการเสร็จสิ้น ${GREEN}✨${NC}"
