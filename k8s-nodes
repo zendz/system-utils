@@ -1,0 +1,769 @@
+#!/usr/bin/env python3
+"""
+k8s-nodes: A tool for displaying Kubernetes node information with flexible grouping options.
+"""
+
+import json
+import subprocess
+import re
+import os
+import argparse
+from collections import defaultdict
+from typing import Dict, List, Any, Tuple, DefaultDict
+from abc import ABC, abstractmethod
+import textwrap # Add textwrap import
+
+
+class Colors:
+    """ANSI color codes for terminal output."""
+    HEADER = '\033[95m'
+    BLUE = '\033[94m'
+    CYAN = '\033[96m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+    END = '\033[0m'
+
+
+class NodeTypeDetectorStrategy(ABC):
+    """Abstract base class for node type detection strategies."""
+    @abstractmethod
+    def detect(self, node: Dict) -> Tuple[str, str] | None:
+        """
+        Detects the node type and pool name.
+        Returns (type, pool_name) if detected, otherwise None.
+        """
+        pass
+
+class KarpenterDetector(NodeTypeDetectorStrategy):
+    """Detects Karpenter nodes."""
+    def detect(self, node: Dict) -> Tuple[str, str] | None:
+        labels = node['metadata'].get('labels', {})
+        if 'karpenter.sh/nodepool' in labels:
+            return 'karpenter', labels['karpenter.sh/nodepool']
+        return None
+
+class EKSManagedDetector(NodeTypeDetectorStrategy):
+    """Detects EKS managed nodegroup nodes."""
+    def detect(self, node: Dict) -> Tuple[str, str] | None:
+        labels = node['metadata'].get('labels', {})
+        if 'eks.amazonaws.com/nodegroup' in labels:
+            return 'eks-managed', labels['eks.amazonaws.com/nodegroup']
+        return None
+
+class EKSSelfManagedDetector(NodeTypeDetectorStrategy):
+    """Detects EKS self-managed nodegroup nodes."""
+    def detect(self, node: Dict) -> Tuple[str, str] | None:
+        labels = node['metadata'].get('labels', {})
+        if 'alpha.eksctl.io/nodegroup-name' in labels:
+            return 'eks-self-managed', labels['alpha.eksctl.io/nodegroup-name']
+        return None
+
+class FargateDetector(NodeTypeDetectorStrategy):
+    """Detects Fargate nodes."""
+    def detect(self, node: Dict) -> Tuple[str, str] | None:
+        node_name = node['metadata']['name']
+        labels = node['metadata'].get('labels', {})
+        if node_name.startswith('fargate'):
+            if 'eks.amazonaws.com/fargate-profile' in labels:
+                return 'fargate', f"fargate-{labels['eks.amazonaws.com/fargate-profile']}"
+            return 'fargate', 'fargate'
+        return None
+
+class DefaultDetector(NodeTypeDetectorStrategy):
+    """Default detector for unknown node types."""
+    def detect(self, node: Dict) -> Tuple[str, str] | None:
+        return 'unknown', 'none'
+
+
+class NodeDisplay:
+    """Main class for displaying Kubernetes node information."""
+
+    MEM_REQ_CLEAN_RE = re.compile(r'[^\d]')
+    MEM_CAP_CLEAN_RE = re.compile(r'Ki$')
+    MEM_USAGE_CLEAN_RE = re.compile(r'Mi$')
+    STATUS_CLEAN_RE = re.compile(r', NoSchedule|, NoExecute|, PreferNoSchedule')
+    
+    def __init__(self):
+        self.args = self._parse_arguments()
+        self._set_terminal_width()  # Initial terminal width setting
+        self.nodes_data = self._get_nodes_data()
+        self.usage_data = self._get_usage_data()
+        self.all_nodes = []
+        self.node_type_detectors: List[NodeTypeDetectorStrategy] = [
+            KarpenterDetector(),
+            EKSManagedDetector(),
+            EKSSelfManagedDetector(),
+            FargateDetector(),
+            DefaultDetector()  # Fallback detector
+        ]
+        
+    def _parse_arguments(self) -> argparse.Namespace:
+        """Parse command line arguments."""
+        parser = argparse.ArgumentParser(
+            description='Display Kubernetes node information with various grouping options'
+        )
+        parser.add_argument('--label', '-l', type=str, nargs='+',
+            help='Group nodes by one or more labels. If multiple labels are provided, nodes will be grouped hierarchically (e.g., "topology.kubernetes.io/zone node-role.kubernetes.io/master")')
+        parser.add_argument('--instance-tag-keys', '-t', type=str, nargs='+',
+            help='Group nodes by one or more instance tag keys. Assumes tags are present as node labels.')
+        parser.add_argument('--nodepool', '-n', action='store_true', 
+            help='Group nodes by nodepool/nodegroup. Can be combined with --label or --instance-tag-keys.')
+        parser.add_argument('--all', '-a', action='store_true', 
+            help='Show all nodes without grouping')
+        parser.add_argument('--sort', '-s', choices=['cpu', 'memory', 'name'], default='cpu', 
+            help='Sort nodes by: cpu, memory, or name (default: cpu)')
+        
+        args = parser.parse_args()
+        
+        # Default to nodepool grouping if no other specific grouping is chosen
+        if not args.label and not args.all and not args.nodepool and not args.instance_tag_keys:
+            args.nodepool = True
+            
+        return args
+    
+    def _set_terminal_width(self) -> None:
+        """Get terminal width for formatting output."""
+        try:
+            self.terminal_width = os.get_terminal_size().columns
+            # print("TERMINAL WIDTH: %s", self.terminal_width)
+        except (OSError, IOError):
+            self.terminal_width = 120
+        
+        # Ensure minimum width
+        if self.terminal_width < 80:
+            self.terminal_width = 80
+    
+    def _run_cmd(self, cmd: str) -> str:
+        """Run a shell command and return its output."""
+        try:
+            return subprocess.check_output(cmd, shell=True).decode('utf-8')
+        except subprocess.CalledProcessError:
+            return ""
+    
+    def _get_nodes_data(self) -> Dict:
+        """Get Kubernetes nodes data from kubectl."""
+        nodes_json = self._run_cmd("kubectl get nodes -o json")
+        try:
+            return json.loads(nodes_json)
+        except json.JSONDecodeError:
+            print(f"{Colors.RED}Error: Could not parse node data from kubectl{Colors.END}")
+            return {"items": []}
+    
+    def _get_usage_data(self) -> Dict[str, Dict[str, str]]:
+        """Get node usage data from kubectl top."""
+        usage_data = self._run_cmd("kubectl top node --no-headers")
+        result = {}
+        
+        for line in usage_data.strip().split('\n'):
+            if not line:
+                continue
+                
+            parts = line.split()
+            if len(parts) >= 5:
+                node_name = parts[0]
+                
+                # Handle CPU usage with error checking
+                cpu_usage = parts[1]
+                if cpu_usage == '<unknown>':
+                    cpu_usage = '0m'
+                    cpu_percent = '0'
+                else:
+                    cpu_percent = parts[2].rstrip('%')
+                    
+                # Handle memory usage with error checking
+                mem_usage = parts[3]
+                if mem_usage == '<unknown>':
+                    mem_usage = '0Mi'
+                    mem_percent = '0'
+                else:
+                    mem_percent = parts[4].rstrip('%')
+                
+                result[node_name] = {
+                    'cpu_usage': cpu_usage,
+                    'cpu_percent': cpu_percent,
+                    'mem_usage': mem_usage,
+                    'mem_percent': mem_percent
+                }
+                
+        return result
+    
+    def _detect_node_type(self, node: Dict) -> Tuple[str, str]:
+        """Detect node type and pool name from node metadata using strategies."""
+        for detector in self.node_type_detectors:
+            result = detector.detect(node)
+            if result:
+                return result
+        # Should be unreachable if DefaultDetector is always last and returns a non-None value
+        return 'unknown', 'none' 
+    
+    def _get_node_status_and_taints(self, node: Dict) -> Tuple[str, List[str]]:
+        """Extract node status information and taints separately."""
+        # Check ready condition
+        status = "Ready"
+        for condition in node['status'].get('conditions', []):
+            if condition['type'] == 'Ready':
+                if condition['status'] != 'True':
+                    status = "NotReady"
+                    if 'reason' in condition:
+                        status = condition['reason']
+        
+        # Check pressure conditions
+        conditions_found = []
+        for condition in node['status'].get('conditions', []):
+            if condition['type'] in ['DiskPressure', 'MemoryPressure', 'PIDPressure', 'NetworkUnavailable']:
+                if condition['status'] == 'True':
+                    conditions_found.append(condition['type'])
+        
+        if conditions_found:
+            status = f"{status}, {', '.join(conditions_found)}"
+        
+        # Extract taints separately with full details
+        taints = node['spec'].get('taints', [])
+        taint_details = []
+        
+        for taint in taints:
+            key = taint.get('key', '')
+            value = taint.get('value', '')
+            effect = taint.get('effect', '')
+            
+            # Format as key=value:effect
+            taint_str = key
+            if value:
+                taint_str += f"={value}"
+            if effect:
+                taint_str += f":{effect}"
+                
+            taint_details.append(taint_str)
+        
+        return status, taint_details    
+
+    def _process_nodes(self) -> None:
+        """Process all nodes data and collect node information."""
+        for node in self.nodes_data.get('items', []):
+            node_name = node['metadata']['name']
+            labels = node['metadata'].get('labels', {})
+            
+            # Get node type and pool
+            pool_type, nodepool = self._detect_node_type(node)
+            
+            # Get custom grouping label if specified
+            custom_label_value: Any = "none" # Can be string or tuple
+            custom_label_display: str = "none"
+
+            if self.args.label:
+                if isinstance(self.args.label, list): # Multiple labels
+                    label_values = [labels.get(lbl_key, "N/A") for lbl_key in self.args.label]
+                    custom_label_value = tuple(label_values)
+                    custom_label_display = ", ".join([f"{key}={val}" for key, val in zip(self.args.label, label_values)])
+                elif self.args.label in labels: # Single label (kept for safety, though nargs='+' makes it a list)
+                    custom_label_value = labels[self.args.label]
+                    custom_label_display = f"{self.args.label}={custom_label_value}"
+                else: # Label not found
+                    if isinstance(self.args.label, list):
+                         custom_label_display = ", ".join([f"{key}=N/A" for key in self.args.label])
+                         custom_label_value = tuple(["N/A"] * len(self.args.label))
+                    else:
+                        custom_label_display = f"{self.args.label}=N/A"
+                        custom_label_value = "N/A"
+
+            # Get instance tag values if specified
+            instance_tag_value: Any = "none"
+            instance_tag_display: str = "none"
+            if self.args.instance_tag_keys:
+                tag_values = [labels.get(tag_key, "N/A") for tag_key in self.args.instance_tag_keys]
+                instance_tag_value = tuple(tag_values)
+                instance_tag_display = ", ".join([f"{key}={val}" for key, val in zip(self.args.instance_tag_keys, tag_values)])
+
+            # Get instance type
+            instance_type = labels.get('node.kubernetes.io/instance-type', 'unknown')
+            
+            # For Fargate, get a meaningful instance size
+            if pool_type == "fargate" and instance_type == 'unknown':
+                cpu_req = node['status']['allocatable'].get('cpu', '0')
+                mem_req = node['status']['allocatable'].get('memory', '0')
+                instance_type = f"fargate-{cpu_req}vCPU-{int(int(self.MEM_REQ_CLEAN_RE.sub('', mem_req))/1024/1024)}GB"
+            
+            # Get capacity
+            cpu_cap = node['status']['capacity'].get('cpu', '0')
+            mem_cap = node['status']['capacity'].get('memory', '0Ki')
+            
+            # Convert memory capacity to GB
+            try:
+                mem_cap_gb = float(self.MEM_CAP_CLEAN_RE.sub('', mem_cap)) / (1024 * 1024)
+            except ValueError:
+                mem_cap_gb = 0.0
+            
+            # Get node status and taints separately
+            status, taints = self._get_node_status_and_taints(node)
+            
+            # Get usage info
+            usage = self.usage_data.get(node_name, {
+                'cpu_usage': '0m',
+                'cpu_percent': '0',
+                'mem_usage': '0Mi',
+                'mem_percent': '0'
+            })
+            
+            # Convert memory to GB
+            mem_usage_mi = self.MEM_USAGE_CLEAN_RE.sub('', usage['mem_usage'])
+            try:
+                mem_usage_gb = float(mem_usage_mi) / 1024
+            except ValueError:
+                mem_usage_gb = 0.0
+            
+            # Convert percentages to integers
+            try:
+                cpu_percent = int(usage['cpu_percent'])
+            except ValueError:
+                cpu_percent = 0
+            
+            try:
+                mem_percent = int(usage['mem_percent'])
+            except ValueError:
+                mem_percent = 0
+            
+            # Add node to list
+            self.all_nodes.append({
+                'name': node_name,
+                'pool_type': pool_type,
+                'nodepool': nodepool,
+                'instance_type': instance_type,
+                'status': status,
+                'taints': taints,  # Store taints separately
+                'cpu_cap': cpu_cap,
+                'cpu_usage': usage['cpu_usage'],
+                'cpu_percent': cpu_percent,
+                'mem_cap': mem_cap_gb,
+                'mem_usage': mem_usage_gb,
+                'mem_percent': mem_percent,
+                'labels': labels,
+                'custom_label_value': custom_label_value,
+                'custom_label_display': custom_label_display,
+                'instance_tag_value': instance_tag_value,
+                'instance_tag_display': instance_tag_display
+            })
+    
+    def _color_percent(self, percent: int) -> str:
+        """Color-code percentage values based on thresholds."""
+        if percent >= 80:
+            return f"{Colors.RED}{percent}%{Colors.END}"
+        elif percent >= 50:
+            return f"{Colors.YELLOW}{percent}%{Colors.END}"
+        else:
+            return f"{Colors.GREEN}{percent}%{Colors.END}"
+    
+    def _color_status(self, status: str) -> str:
+        """Color-code node status based on condition."""
+        if status == "Ready":
+            return f"{Colors.GREEN}{status}{Colors.END}"
+        elif "NoSchedule" in status or "NoExecute" in status:
+            return f"{Colors.YELLOW}{status}{Colors.END}"
+        elif "Pressure" in status:
+            return f"{Colors.YELLOW}{status}{Colors.END}"
+        elif status != "Ready" and "NotReady" in status:
+            return f"{Colors.RED}{status}{Colors.END}"
+        return f"{Colors.YELLOW}{status}{Colors.END}"
+    
+    def _color_pool_type(self, pool_type: str) -> str:
+        """Color-code pool type for display."""
+        if pool_type == "karpenter":
+            return f"{Colors.CYAN}Karpenter{Colors.END}"
+        elif pool_type == "eks-managed":
+            return f"{Colors.BLUE}EKS Managed{Colors.END}"
+        elif pool_type == "eks-self-managed":
+            return f"{Colors.YELLOW}EKS Self-Managed{Colors.END}"
+        elif pool_type == "fargate":
+            return f"{Colors.GREEN}Fargate{Colors.END}"
+        else:
+            return pool_type
+    
+    def _sort_nodes(self) -> None:
+        """Sort nodes based on specified criteria."""
+        sort_key = self.args.sort
+        if sort_key == 'cpu':
+            self.all_nodes.sort(key=lambda x: x['cpu_percent'], reverse=True)
+        elif sort_key == 'memory':
+            self.all_nodes.sort(key=lambda x: x['mem_percent'], reverse=True)
+        else:  # sort by name
+            self.all_nodes.sort(key=lambda x: x['name'])
+    
+    def _group_nodes(self) -> Dict[Any, Any]:
+        """Group nodes according to command-line options."""
+        if self.args.all:
+            # No grouping, just use all nodes
+            return {"All Nodes": self.all_nodes}
+
+        if self.args.nodepool and (self.args.label or self.args.instance_tag_keys):
+            # Combined grouping: nodepool -> (label or instance_tag)
+            combined_grouped = defaultdict(lambda: defaultdict(list))
+            for node in self.all_nodes:
+                nodepool_key = f"{node['pool_type']}:{node['nodepool']}"
+                secondary_key: Any = "none" # Default secondary key
+                if self.args.label: # Label takes precedence for secondary grouping
+                    secondary_key = node['custom_label_value']
+                elif self.args.instance_tag_keys:
+                    secondary_key = node['instance_tag_value']
+                combined_grouped[nodepool_key][secondary_key].append(node)
+            return combined_grouped
+            
+        elif self.args.label:
+            # Group by custom label only
+            grouped = defaultdict(list)
+            for node in self.all_nodes:
+                grouped[node['custom_label_value']].append(node)
+            return grouped
+
+        elif self.args.instance_tag_keys:
+            # Group by instance tags only
+            grouped = defaultdict(list)
+            for node in self.all_nodes:
+                grouped[node['instance_tag_value']].append(node)
+            return grouped
+            
+        elif self.args.nodepool: # This implies not self.args.label/instance_tag_keys due to the elif
+            # Default: Group by nodepool only
+            grouped = defaultdict(list)
+            for node in self.all_nodes:
+                grouped[f"{node['pool_type']}:{node['nodepool']}"].append(node)
+            return grouped
+        
+        # Fallback, though _parse_arguments should prevent this state
+        return {"All Nodes": self.all_nodes}
+    
+    def _calculate_column_widths(self) -> Tuple[int, int, int, int]:
+        """Calculate optimal column widths based on content by iterating once."""
+        if not self.all_nodes:
+            return 20, 15, 25, 15  # node, instance, status, taints widths (min taints_width)
+
+        max_node_len = 0
+        max_instance_len = 0
+        max_status_len = 0
+        max_individual_taint_len = 0 # Changed from max_raw_taints_len
+
+        for node in self.all_nodes:
+            max_node_len = max(max_node_len, len(node['name']))
+            max_instance_len = max(max_instance_len, len(node['instance_type']))
+            
+            cleaned_status = self.STATUS_CLEAN_RE.sub('', node['status'])
+            max_status_len = max(max_status_len, len(cleaned_status))
+            
+            if node.get('taints'):
+                for taint_str in node.get('taints', []): # Iterate individual taints
+                    max_individual_taint_len = max(max_individual_taint_len, len(taint_str))
+            
+        node_width = max_node_len + 2
+        instance_width = max_instance_len + 2
+        status_width = max_status_len + 2
+        
+        # Dynamic taints_width based on the longest individual taint, with a minimum
+        min_taints_width = 15 
+        taints_padding = 2
+        taints_width = max(min_taints_width, max_individual_taint_len + taints_padding)
+        
+        # Adjust node_width if total exceeds terminal_width
+        # Header columns: NODE, INSTANCE TYPE, STATUS, TAINTS, CPU (20), MEMORY (20)
+        # 5 spaces between 6 columns
+        other_cols_width_for_adjustment = instance_width + status_width + taints_width + 20 + 20 + 5 # Using new taints_width
+        
+        required_width = node_width + other_cols_width_for_adjustment
+        if required_width > self.terminal_width:
+            available_for_node = self.terminal_width - other_cols_width_for_adjustment
+            node_width = max(20, available_for_node) # Ensure node_width is at least 20
+                
+        return node_width, instance_width, status_width, taints_width
+
+    def _print_header(self, node_width: int, instance_width: int, status_width: int, taints_width: int) -> None:
+        """Print the table header."""
+        # Update terminal width before printing
+        self._set_terminal_width()
+        
+        header = f"{Colors.BOLD}{'NODE':<{node_width}} {'INSTANCE TYPE':<{instance_width}} {'STATUS':<{status_width}} {'TAINTS':<{taints_width}} {'CPU':<20} {'MEMORY':<20}{Colors.END}"
+        
+        # print("=" * self.terminal_width)
+        print(header)
+        print("─" * self.terminal_width)
+    
+    def _print_nodepool_grouped(self, grouped_nodes: Dict[str, List[Dict]], widths: Tuple[int, int, int, int]) -> None:
+        """Print nodes grouped by nodepool."""
+        node_width, instance_width, status_width, taints_width = widths
+        
+        self._set_terminal_width()
+
+        # Group by pool type
+        pool_types = defaultdict(list)
+        
+        for group_key in grouped_nodes.keys():
+            pool_type, pool_name = group_key.split(":", 1)
+            pool_types[pool_type].append(pool_name)
+        
+        # Sort pools within each type
+        for pool_type in pool_types:
+            pool_types[pool_type].sort()
+        
+        # Print nodes grouped by pool type and nodepool
+        for pool_type in ["karpenter", "eks-managed", "eks-self-managed", "fargate", "unknown"]:
+            if not pool_types.get(pool_type):
+                continue
+                
+            # Print pool type header
+            print("\n")
+            print("=" * self.terminal_width)
+            print(f"{Colors.BOLD}{self._color_pool_type(pool_type)} Nodes{Colors.END}")
+            self._print_header(*widths) # Add this line to print the main table header for each pool type
+            
+            for pool_name in pool_types[pool_type]:
+                group_key = f"{pool_type}:{pool_name}"
+                nodes = grouped_nodes[group_key]
+                
+                self._print_group_header(pool_name, nodes)
+                self._print_group_summary(nodes)
+                self._print_nodes_in_group(nodes, pool_name, pool_type, widths)
+    
+    def _print_custom_grouped(self, grouped_nodes: Dict[str, List[Dict]], widths: Tuple[int, int, int, int]) -> None:
+        """Print nodes grouped by custom label or all nodes."""
+        for group_name_key, nodes in sorted(grouped_nodes.items(), key=lambda item: str(item[0])):
+            if not nodes: continue # Skip if a group is unexpectedly empty
+
+            # Print group header
+            if self.args.all:
+                print(f"\n{Colors.BOLD}{Colors.BLUE}All Nodes ({len(nodes)} total){Colors.END}")
+            else:
+                # Use the pre-formatted display string from the first node in the group
+                group_display_name = "N/A" # Default
+                if self.args.label:
+                    group_display_name = nodes[0]['custom_label_display']
+                elif self.args.instance_tag_keys: # Check if grouping by instance tags
+                    group_display_name = nodes[0]['instance_tag_display']
+                
+                print(f"\n{Colors.BOLD}{Colors.BLUE}  == {group_display_name} ({len(nodes)} nodes) =={Colors.END}")
+            
+            self._print_group_summary(nodes)
+            
+            # Print nodes
+            self._print_nodes_in_group(nodes, str(group_name_key), None, widths)
+    
+    def _print_group_header(self, group_name: str, nodes: List[Dict]) -> None:
+        """Print a header for a group of nodes."""
+        print(f"\n{Colors.BOLD}{Colors.BLUE}  == Nodepool: {group_name} ({len(nodes)} nodes) =={Colors.END}")
+    
+    def _print_group_summary(self, nodes: List[Dict]) -> None:
+        """Print summary information for a group of nodes."""
+        # Count instances of each type
+        instance_counts = defaultdict(int)
+        for node in nodes:
+            instance_counts[node['instance_type']] += 1
+        
+        # Print instance type summary
+        instance_summary = ", ".join([f"{count}x {instance}" for instance, count in 
+                                    sorted(instance_counts.items(), key=lambda x: (-x[1], x[0]))])
+        if instance_summary:
+            print(f"{Colors.BLUE}     Instances: {instance_summary}{Colors.END}")
+        
+        # Count node status
+        status_counts = defaultdict(int)
+        for node in nodes:
+            status_counts[node['status']] += 1
+        
+        # Print status summary
+        status_summary = ", ".join([f"{count}x {status}" for status, count in 
+                                sorted(status_counts.items(), key=lambda x: (-x[1], x[0]))])
+        print(f"{Colors.YELLOW}     Status: {status_summary}{Colors.END}")
+    
+    def _print_nodes_in_group(self, nodes: List[Dict], group_name: str, pool_type: str, 
+                     widths: Tuple[int, int, int, int]) -> None:
+        """Print information for each node in a group."""
+        node_width, instance_width, status_width, taints_width = widths
+        
+        for node in nodes:
+            # Shorten node name if needed
+            if node_width < len(node['name']):
+                display_name = node['name'][:node_width-3] + "..."
+            else:
+                display_name = node['name']
+            
+            node_taints_list = node.get('taints', [])
+            
+            # Format usage info with colors
+            cpu_info = f"{node['cpu_usage']}/{node['cpu_cap']} ({self._color_percent(node['cpu_percent'])})"
+            mem_info = f"{node['mem_usage']:.1f}GB/{node['mem_cap']:.1f}GB ({self._color_percent(node['mem_percent'])})"
+
+            if not node_taints_list:
+                # Node has no taints, print one line with empty taint
+                print(f"{display_name:<{node_width}} {node['instance_type']:<{instance_width}} "
+                      f"{self._color_status(node['status']):<{status_width+10}} {'':<{taints_width}} {cpu_info:<25} {mem_info:<25}")
+            else:
+                first_line_printed_for_node = False
+                for taint_index, individual_taint_str in enumerate(node_taints_list):
+                    # Wrap each individual taint string if it exceeds taints_width
+                    wrapped_individual_taint = textwrap.wrap(
+                        individual_taint_str, 
+                        width=taints_width if taints_width > 0 else 10, # Ensure width is positive
+                        drop_whitespace=False, # Preserve spaces in taints
+                        replace_whitespace=False 
+                    )
+                    if not wrapped_individual_taint: # Handle case where a taint might be empty string
+                        wrapped_individual_taint = [""]
+
+                    for wrap_index, taint_line_segment in enumerate(wrapped_individual_taint):
+                        if not first_line_printed_for_node:
+                            # First overall line for this node (first taint, or first part of its wrap)
+                            print(f"{display_name:<{node_width}} {node['instance_type']:<{instance_width}} "
+                                  f"{self._color_status(node['status']):<{status_width+10}} {taint_line_segment:<{taints_width}} {cpu_info:<25} {mem_info:<25}")
+                            first_line_printed_for_node = True
+                        else:
+                            # Subsequent taint for the same node, or subsequent wrapped line of a taint
+                            print(f"{'':<{node_width}} {'':<{instance_width}} "
+                                  f"{'':<{status_width+10}} {taint_line_segment:<{taints_width}} {'':<25} {'':<25}")
+
+    def _print_combined_grouped(self, combined_grouped_nodes: Dict[str, Dict[Any, List[Dict]]], widths: Tuple[int, int, int, int]) -> None:
+        """Print nodes grouped first by nodepool, then by custom label."""
+        node_width, instance_width, status_width, taints_width = widths
+
+        # Organize by pool_type for ordered printing
+        organized_by_pool_type = defaultdict(lambda: defaultdict(dict)) # pool_type -> nodepool_name -> label_groups
+        for nodepool_key, label_groups in combined_grouped_nodes.items():
+            pool_type, nodepool_name = nodepool_key.split(":", 1)
+            organized_by_pool_type[pool_type][nodepool_name] = label_groups
+
+        # Sort nodepool_names within each pool_type and label_keys within each nodepool
+        for pool_type in list(organized_by_pool_type.keys()): # Iterate over a copy of keys if modifying
+            sorted_nodepools = {}
+            for nodepool_name, label_groups in sorted(organized_by_pool_type[pool_type].items()):
+                sorted_label_groups = dict(sorted(label_groups.items(), key=lambda item: str(item[0]))) # Sort secondary keys
+                sorted_nodepools[nodepool_name] = sorted_label_groups
+            organized_by_pool_type[pool_type] = sorted_nodepools
+            
+
+        for pool_type_iter_name in ["karpenter", "eks-managed", "eks-self-managed", "fargate", "unknown"]:
+            if not organized_by_pool_type.get(pool_type_iter_name):
+                continue
+            
+            print(f"\n{Colors.BOLD}{self._color_pool_type(pool_type_iter_name)} Nodes{Colors.END}")
+            
+            nodepools_in_type = organized_by_pool_type[pool_type_iter_name]
+            for nodepool_name, secondary_groups in nodepools_in_type.items(): # Renamed label_groups to secondary_groups
+                all_nodes_in_this_nodepool_group = [
+                    node for nodes_list in secondary_groups.values() for node in nodes_list
+                ]
+                
+                if not all_nodes_in_this_nodepool_group: continue
+
+                self._print_group_header(nodepool_name, all_nodes_in_this_nodepool_group)
+                self._print_group_summary(all_nodes_in_this_nodepool_group)
+                self._print_header(*widths) # Main table header for this nodepool section
+
+                for secondary_key, nodes_in_secondary_group in secondary_groups.items(): # Iterate over sorted secondary_groups
+                    if not nodes_in_secondary_group: continue
+
+                    secondary_group_display_name = "N/A"
+                    group_type_prefix = "Group" # Default prefix
+                    if self.args.label: # Label takes precedence for display name if present
+                        secondary_group_display_name = nodes_in_secondary_group[0]['custom_label_display']
+                        group_type_prefix = "Label Group"
+                    elif self.args.instance_tag_keys:
+                        secondary_group_display_name = nodes_in_secondary_group[0]['instance_tag_display']
+                        group_type_prefix = "Instance Tag Group"
+                    
+                    print(f"{Colors.BOLD}{Colors.GREEN}    -- {group_type_prefix}: {secondary_group_display_name} ({len(nodes_in_secondary_group)} nodes) --{Colors.END}")
+                    
+                    self._print_nodes_in_group(nodes_in_secondary_group, str(secondary_key), pool_type_iter_name, widths)
+
+    def _print_summary(self) -> None:
+        """Print summary information for all nodes."""
+        # Basic summary
+        total_nodes = len(self.all_nodes)
+        print(f"\n{Colors.BOLD}Total: {total_nodes} nodes{Colors.END}")
+        
+        # Count by pool type
+        pool_type_counts = defaultdict(int)
+        for node in self.all_nodes:
+            pool_type_counts[node['pool_type']] += 1
+        
+        # Print pool type distribution
+        pool_type_summary = ", ".join([f"{count} {self._color_pool_type(pool_type)}" for pool_type, count in 
+                                     sorted(pool_type_counts.items(), key=lambda x: (-x[1], x[0]))])
+        print(f"{Colors.BOLD}Distribution: {pool_type_summary}{Colors.END}")
+        
+        # Find problematic nodes
+        high_cpu = [node['name'] for node in self.all_nodes if node['cpu_percent'] >= 80]
+        high_mem = [node['name'] for node in self.all_nodes if node['mem_percent'] >= 80]
+        not_ready = [node['name'] for node in self.all_nodes if "NotReady" in node['status']]
+        with_taints = [node['name'] for node in self.all_nodes if node.get('taints')]
+        
+        if high_cpu:
+            print(f"{Colors.BOLD}{Colors.RED}High CPU utilization (≥80%): {len(high_cpu)} nodes{Colors.END}")
+        
+        if high_mem:
+            print(f"{Colors.BOLD}{Colors.RED}High memory utilization (≥80%): {len(high_mem)} nodes{Colors.END}")
+        
+        if not_ready:
+            print(f"{Colors.BOLD}{Colors.RED}Not Ready: {len(not_ready)} nodes{Colors.END}")
+        
+        if with_taints:
+            print(f"{Colors.BOLD}{Colors.YELLOW}Tainted nodes: {len(with_taints)} nodes{Colors.END}")
+    
+    def _print_help(self) -> None:
+        """Print usage help information."""
+        print(f"\n{Colors.BOLD}Usage: k8s-nodes [OPTIONS]{Colors.END}")
+        print("Options:")
+        print("  --label, -l LABEL [LABEL ...]: Group nodes by one or more specified labels (e.g., --label topology.kubernetes.io/zone role)")
+        print("  --instance-tag-keys, -t KEY [KEY ...]: Group nodes by one or more instance tag keys (node labels)")
+        print("  --nodepool, -n: Group nodes by nodepool/nodegroup (default if no other primary grouping)")
+        print("     Can be combined with --label or --instance-tag-keys for secondary grouping.")
+        print("     If both --label and --instance-tag-keys are given with --nodepool, --label takes precedence.")
+        print("  --all, -a: Show all nodes without grouping")
+        print("  --sort, -s: Sort nodes by cpu (default), memory, or name")
+    
+    def run(self) -> None:
+        """Run the node display tool."""
+        # Process and sort nodes
+        self._process_nodes()
+        self._sort_nodes()
+        
+        # Exit if no nodes found
+        if not self.all_nodes:
+            print(f"{Colors.RED}No nodes found in the cluster{Colors.END}")
+            return
+        
+        # Group nodes according to options
+        grouped_nodes = self._group_nodes()
+        
+        # Calculate column widths - this will also update terminal width
+        column_widths = self._calculate_column_widths()
+        
+        # Determine primary and secondary grouping for display
+        is_combined_grouping = self.args.nodepool and (self.args.label or self.args.instance_tag_keys)
+        # Nodepool only (or default if nothing else specified)
+        is_nodepool_primary = self.args.nodepool and not (self.args.label or self.args.instance_tag_keys)
+        is_label_primary = self.args.label and not self.args.nodepool # Label is primary, not combined with nodepool
+        # Instance tags primary, not combined with nodepool and label not present as primary
+        is_instancetag_primary = self.args.instance_tag_keys and not self.args.nodepool and not self.args.label
+
+
+        if is_combined_grouping:
+            self._print_combined_grouped(grouped_nodes, column_widths)
+        elif is_nodepool_primary:
+            self._print_nodepool_grouped(grouped_nodes, column_widths)
+        elif is_label_primary:
+            print(f"\n{Colors.BOLD}{Colors.BLUE}Nodes grouped by Label(s){Colors.END}")
+            self._print_header(*column_widths)
+            self._print_custom_grouped(grouped_nodes, column_widths)
+        elif is_instancetag_primary:
+            print(f"\n{Colors.BOLD}{Colors.BLUE}Nodes grouped by Instance Tag(s){Colors.END}")
+            self._print_header(*column_widths)
+            self._print_custom_grouped(grouped_nodes, column_widths) # Reuses _print_custom_grouped
+        elif self.args.all:
+            # _print_custom_grouped handles the "All Nodes" title when self.args.all is true
+            self._print_header(*column_widths)
+            self._print_custom_grouped(grouped_nodes, column_widths)
+        
+        # Print summary
+        self._print_summary()
+        
+
+if __name__ == '__main__':
+    display = NodeDisplay()
+    display.run()
